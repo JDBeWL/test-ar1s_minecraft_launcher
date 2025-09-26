@@ -1507,25 +1507,6 @@ async fn set_saved_uuid(uuid: String) -> Result<(), LauncherError> {
     Ok(())
 }
 
-// 尝试修改WebView2进程名称的函数
-#[cfg(target_os = "windows")]
-fn try_rename_webview_process() {
-    use std::thread;
-    use std::time::Duration;
-    
-    // 在后台线程中执行，以便不阻塞主线程
-    thread::spawn(|| {
-        // 等待一段时间，确保WebView2进程已经启动
-        thread::sleep(Duration::from_secs(2));
-        
-        println!("尝试修改WebView2进程名称");
-        
-        // 注意：这里只是记录日志，实际上我们无法直接修改WebView2进程的名称
-        // 因为WebView2进程是由Microsoft Edge WebView2运行时控制的
-        println!("WebView2进程名称由Microsoft Edge WebView2运行时控制，无法直接修改");
-    });
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1534,21 +1515,6 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         // 对话框功能已内置
         .plugin(tauri_plugin_http::init())
-        .setup(|app| {
-            // 设置WebView进程名称
-            #[cfg(target_os = "windows")]
-            {
-                // 尝试修改WebView2进程名称
-                try_rename_webview_process();
-                
-                // 在setup中注册一个事件处理器，当窗口创建后执行
-                app.listen("tauri://window-created", move |_| {
-                    // 这里无法直接访问窗口，但我们可以在前端代码中设置用户代理
-                    println!("窗口已创建，尝试设置WebView用户代理");
-                });
-            }
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             get_versions,
             download_version,
