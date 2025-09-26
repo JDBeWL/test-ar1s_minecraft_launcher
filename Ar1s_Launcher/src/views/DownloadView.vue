@@ -45,8 +45,7 @@ async function fetchVersions() {
 // Start a download
 async function startDownload(versionId: string) {
   selectedVersion.value = versionId;
-  // Reset progress before starting
-  downloadProgress.value = { progress: 0, total: 0, speed: 0, status: 'downloading' };
+  downloadProgress.value.status = 'downloading'; // Only update status
   
   try {
     await invoke('download_version', { 
@@ -78,9 +77,9 @@ const filteredVersions = computed(() => {
   });
 
   if (sortOrder.value === 'newest') {
-    filtered.sort((a, b) => new Date(b.release_time).getTime() - new Date(a.release_time).getTime());
+    filtered.sort((a, b) => new Date(b.releaseTime).getTime() - new Date(a.releaseTime).getTime());
   } else if (sortOrder.value === 'oldest') {
-    filtered.sort((a, b) => new Date(a.release_time).getTime() - new Date(b.release_time).getTime());
+    filtered.sort((a, b) => new Date(a.releaseTime).getTime() - new Date(b.releaseTime).getTime());
   } else if (sortOrder.value === 'az') {
     filtered.sort((a, b) => a.id.localeCompare(b.id));
   } else if (sortOrder.value === 'za') {
@@ -211,7 +210,7 @@ onMounted(async () => {
               :headers="[
                 { title: '版本', key: 'id', align: 'start' },
                 { title: '类型', key: 'type', align: 'center' },
-                { title: '发布日期', key: 'release_time', align: 'end' },
+                { title: '发布日期', key: 'releaseTime', align: 'end' },
                 { title: '操作', key: 'actions', align: 'end', sortable: false }
               ]"
               :items="paginatedVersions"
@@ -219,8 +218,8 @@ onMounted(async () => {
               items-per-page="-1"
               hide-default-footer
             >
-              <template v-slot:item.release_time="{ item }">
-                {{ new Date(item.release_time).toLocaleDateString() }}
+              <template v-slot:item.releaseTime="{ item }">
+                {{ new Date(item.releaseTime).toLocaleDateString() }}
               </template>
               
               <template v-slot:item.actions="{ item }">

@@ -1,149 +1,60 @@
-use serde::{Deserialize, Serialize};
 use std::fs;
-use md5::Md5;
-use digest::Digest;
-use uuid::Uuid;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tauri::{Emitter, Listener};
-use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use tokio::task::JoinError;
+use tauri::Emitter;
 
-#[derive(Error, Debug)]
-pub enum LauncherError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("Zip error: {0}")]
-    Zip(#[from] zip::result::ZipError),
-    #[error("Tauri error: {0}")]
-    Tauri(#[from] tauri::Error),
-    #[error("Custom error: {0}")]
-    Custom(String),
-}
+use download::{download_all_files as download_all_files_impl};
 
-impl serde::Serialize for LauncherError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("LauncherError", 1)?;
-        state.serialize_field("message", &self.to_string())?;
-        state.end()
-    }
-}
+mod error;
+mod models;
+mod launcher;
+pub mod download;
+pub mod auth;
+pub mod java;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MinecraftVersion {
-    id: String,
-    #[serde(rename = "type")]
-    version_type: String,
-    url: String,
-    #[serde(default)]
-    time: Option<String>,
-    #[serde(rename(deserialize = "releaseTime", serialize = "release_time"))]
-    release_time: Option<String>,
-}
+pub use error::LauncherError;
+pub use models::*;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VersionManifest {
-    latest: LatestVersions,
-    versions: Vec<MinecraftVersion>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LatestVersions {
-    release: String,
-    snapshot: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LaunchOptions {
-    version: String,
-    game_dir: Option<String>,
-    memory: Option<u32>,
-    username: String,
-    offline: bool,
-    java_path: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GameConfig {
-    pub game_dir: String,
-    #[serde(default = "default_true")]
-    pub version_isolation: bool,
-    pub java_path: Option<String>,
-    #[serde(default = "default_download_threads")]
-    pub download_threads: u8,
-    #[serde(default)]
-    pub language: Option<String>,
-    #[serde(default = "default_true")]
-    pub isolate_saves: bool,
-    #[serde(default = "default_true")]
-    pub isolate_resourcepacks: bool,
-    #[serde(default = "default_true")]
-    pub isolate_logs: bool,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub uuid: Option<String>,
-}
-
-fn default_download_threads() -> u8 {
-    8
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum DownloadStatus {
-    Downloading,
-    Completed,
-    Cancelled,
-    Error(String),
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct DownloadProgress {
-    progress: u64,
-    total: u64,
-    speed: f64,
-    status: DownloadStatus,
-}
-
-impl From<JoinError> for LauncherError {
-    fn from(err: JoinError) -> Self {
-        LauncherError::Custom(format!("Task join error: {}", err))
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct GameDirInfo {
-    path: String,
-    versions: Vec<String>,
-    total_size: u64,
-}
+// 直接导出launcher模块中的函数
+pub use launcher::launch_minecraft;
 
 // 获取 Minecraft 版本列表
+// 初始化日志系统
+fn init_logging() -> Result<PathBuf, LauncherError> {
+    println!("[DEBUG] 正在初始化日志系统..."); // 控制台输出
+    
+    let config = load_config()?;
+    let minecraft_dir = PathBuf::from(&config.game_dir);
+    let log_dir = minecraft_dir.join("logs");
+    
+    println!("[DEBUG] 日志目录路径: {}", log_dir.display());
+    
+    fs::create_dir_all(&log_dir)
+        .map_err(|e| LauncherError::Custom(format!("无法创建日志目录: {}", e)))?;
+        
+    println!("[DEBUG] 日志目录创建成功");
+    Ok(log_dir)
+}
+
 #[tauri::command]
 async fn get_versions() -> Result<VersionManifest, LauncherError> {
-    // 创建带超时的HTTP客户端
+    // 初始化日志系统
+    let _ = init_logging()?;
+    
+    // 创建带超时的HTTP客户端 (30秒超时)
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| {
+            let log_file = PathBuf::from("logs").join("version_fetch.log");
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)
+                .unwrap_or_else(|_| std::process::exit(1));
+            let _ = writeln!(log, "[ERROR] 创建HTTP客户端失败: {}", e);
+            LauncherError::Custom(format!("创建HTTP客户端失败: {}", e))
+        })?;
     
     // 优先使用国内镜像站
     let urls = [
@@ -151,16 +62,25 @@ async fn get_versions() -> Result<VersionManifest, LauncherError> {
         "https://launchermeta.mojang.com/mc/game/version_manifest.json"
     ];
 
-    // 创建日志目录
-    let log_dir = PathBuf::from("logs");
-    if !log_dir.exists() {
-        fs::create_dir(&log_dir)?;
-    }
-    let log_file = log_dir.join("version_fetch.log");
+    // 获取并直接使用日志目录
+    let log_file = {
+        let log_dir = init_logging()?;
+        log_dir.join("version_fetch.log")
+    };
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_file)?;
+        .open(&log_file)
+        .map_err(|e| LauncherError::Custom(format!("无法创建日志文件 {}: {}", log_file.display(), e)))?;
+    
+    // 设置日志文件权限（仅限Unix系统）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = log.metadata()?.permissions();
+        perms.set_mode(0o644); // rw-r--r--
+        log.set_permissions(perms)?;
+    }
 
     writeln!(log, "[{}] 开始获取版本列表", chrono::Local::now())?;
 
@@ -183,14 +103,40 @@ async fn get_versions() -> Result<VersionManifest, LauncherError> {
 }
 
 async fn fetch_versions(client: &reqwest::Client, url: &str) -> Result<VersionManifest, LauncherError> {
-    let response = client.get(url).send().await?;
-    let _content_type = response.headers()
+    // 创建日志文件
+    let log_file = PathBuf::from("logs").join("network_debug.log");
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .map_err(|e| LauncherError::Custom(format!("无法创建日志文件 {}: {}", log_file.display(), e)))?;
+
+    writeln!(log, "[DEBUG] 准备发送请求到: {}", url)?;
+    
+    let request = client.get(url);
+    // 获取默认请求头
+    let default_headers = reqwest::header::HeaderMap::new();
+    writeln!(log, "[DEBUG] 请求头: {:?}", default_headers)?;
+    
+    let response = request.send().await.map_err(|e| {
+        let _ = writeln!(log, "[ERROR] 请求失败: {}", e);
+        e
+    })?;
+    
+    writeln!(log, "[DEBUG] 响应状态码: {}", response.status())?;
+    writeln!(log, "[DEBUG] 响应头: {:?}", response.headers())?;
+    
+    let content_type = response.headers()
         .get("content-type")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
-        .to_string(); // 复制字符串以避免借用问题
+        .to_string();
+    writeln!(log, "[DEBUG] Content-Type: {}", content_type)?;
     
-    let bytes = response.bytes().await?;
+    let bytes = response.bytes().await.map_err(|e| {
+        let _ = writeln!(log, "[ERROR] 读取响应体失败: {}", e);
+        e
+    })?;
         
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let text = text.trim_start_matches('\u{feff}').to_string();
@@ -221,14 +167,7 @@ async fn fetch_versions(client: &reqwest::Client, url: &str) -> Result<VersionMa
     Ok(manifest)
 }
 
-// 下载任务
-#[derive(Clone)]
-struct DownloadJob {
-    url: String,
-    fallback_url: Option<String>,
-    path: PathBuf,
-    size: u64,
-}
+
 
 // 下载 Minecraft 版本
 #[tauri::command]
@@ -244,7 +183,7 @@ async fn download_version(
         "https://launchermeta.mojang.com"
     };
 
-    // --- 1. 获取配置和路径 ---
+    // 1. 获取配置和路径
     let config = load_config()?;
     let game_dir = PathBuf::from(&config.game_dir);
     let version_dir = game_dir.join("versions").join(&version_id);
@@ -253,7 +192,7 @@ async fn download_version(
         game_dir.join("assets")
     );
 
-    // --- 2. 获取版本元数据 ---
+    // 2. 获取版本元数据
     let client = reqwest::Client::new();
     let manifest: VersionManifest = client
         .get(&format!("{}/mc/game/version_manifest.json", base_url))
@@ -274,10 +213,10 @@ async fn download_version(
         .or_else(|_| serde_json::from_str(text.trim_start_matches('\u{feff}')))
         .map_err(|_| LauncherError::Custom(format!("无法解析版本JSON for {}", version_id)))?;
 
-    // --- 3. 收集所有待下载的文件 ---
+    // 3. 收集所有待下载的文件
     let mut downloads = Vec::new();
 
-    // c. 客户端 JAR
+    // 客户端 JAR
     let client_info = &version_json["downloads"]["client"];
     let client_url = client_info["url"].as_str().ok_or_else(|| LauncherError::Custom("无法获取客户端下载URL".to_string()))?;
     let client_size = client_info["size"].as_u64().unwrap_or(0);
@@ -294,7 +233,7 @@ async fn download_version(
         size: client_size,
     });
 
-    // --- b. 资源文件 (Assets) ---
+    // 资源文件 (Assets)
     let assets_index_id = version_json["assetIndex"]["id"].as_str().ok_or_else(|| LauncherError::Custom("无法获取资源索引ID".to_string()))?;
     let assets_index_url = version_json["assetIndex"]["url"].as_str().ok_or_else(|| LauncherError::Custom("无法获取资源索引URL".to_string()))?;
     let assets_index_url = if is_mirror {
@@ -306,7 +245,8 @@ async fn download_version(
     let assets_index_path = assets_base_dir.join("indexes").join(format!("{}.json", assets_index_id));
     fs::create_dir_all(assets_index_path.parent().unwrap())?;
 
-    // Download asset index file if not exists or force download
+    // 如果资源索引文件不存在，则从网络下载
+    // 如果资源索引文件存在，则直接读取本地文件
     if !assets_index_path.exists() {
         let response = client.get(&assets_index_url).send().await?;
         let bytes = response.bytes().await?;
@@ -320,13 +260,23 @@ async fn download_version(
         for (_path, obj) in objects {
             let hash = obj["hash"].as_str().ok_or_else(|| LauncherError::Custom("资源缺少hash".to_string()))?;
             let size = obj["size"].as_u64().unwrap_or(0);
-            let url = format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash);
+            let original_url = format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash);
+            let download_url = if is_mirror {
+                format!("https://bmclapi2.bangbang93.com/assets/{}/{}", &hash[..2], hash)
+            } else {
+                original_url.clone()
+            };
             let file_path = assets_base_dir.join("objects").join(&hash[..2]).join(hash);
-            downloads.push(DownloadJob { url, fallback_url: None, path: file_path, size });
+            downloads.push(DownloadJob {
+                url: download_url,
+                fallback_url: if is_mirror { Some(original_url) } else { None },
+                path: file_path,
+                size,
+            });
         }
     }
 
-    // c. 库文件 (Libraries)
+    // 库文件 (Libraries)
     fs::create_dir_all(&libraries_base_dir)?;
     if let Some(libraries) = version_json["libraries"].as_array() {
         for lib in libraries {
@@ -495,7 +445,7 @@ async fn download_version(
     }
 
     // --- 4. 执行批量下载 ---
-    download_all_files(downloads, &window).await?;
+    download_all_files(downloads, &window, mirror).await?;
 
     // --- 5. 保存版本元数据文件 ---
     let version_json_path = version_dir.join(format!("{}.json", version_id));
@@ -504,576 +454,13 @@ async fn download_version(
     Ok(())
 }
 
-
 async fn download_all_files(
     jobs: Vec<DownloadJob>,
     window: &tauri::Window,
+    mirror: Option<String>,
 ) -> Result<(), LauncherError> {
-    let config = load_config()?;
-    let threads = config.download_threads as usize;
     let total_files = jobs.len() as u64;
-
-    // --- Shared State ---
-    let files_downloaded = Arc::new(AtomicU64::new(0));
-    let bytes_downloaded = Arc::new(AtomicU64::new(0));
-    let bytes_since_last = Arc::new(AtomicU64::new(0));
-    let state = Arc::new(AtomicBool::new(true)); // true = running, false = cancelled/stopped
-    let was_cancelled = Arc::new(AtomicBool::new(false));
-    let error_occurred = Arc::new(tokio::sync::Mutex::new(None::<String>));
-
-    // --- Cancellation Listener ---
-    let state_clone = state.clone();
-    let was_cancelled_clone = was_cancelled.clone();
-    window.once("cancel-download", move |_| {
-        state_clone.store(false, Ordering::SeqCst);
-        was_cancelled_clone.store(true, Ordering::SeqCst);
-    });
-
-    // --- Progress Reporter Task ---
-    let reporter_handle = {
-        let files_downloaded = files_downloaded.clone();
-        let bytes_since_last = bytes_since_last.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let report_interval = Duration::from_millis(500);
-
-        tokio::spawn(async move {
-            while state.load(Ordering::SeqCst) {
-                tokio::time::sleep(report_interval).await;
-                if !state.load(Ordering::SeqCst) { break; }
-
-                let downloaded_count = files_downloaded.load(Ordering::SeqCst);
-                let bytes_since = bytes_since_last.swap(0, Ordering::SeqCst);
-                let speed = (bytes_since as f64 / 1024.0) / report_interval.as_secs_f64();
-
-                let progress = DownloadProgress {
-                    progress: downloaded_count,
-                    total: total_files,
-                    speed,
-                    status: DownloadStatus::Downloading,
-                };
-                let _ = window.emit("download-progress", &progress);
-            }
-        })
-    };
-
-    // --- Download Worker Tasks ---
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(threads));
-    let mut handles = vec![];
-
-    for job in jobs {
-        if !state.load(Ordering::SeqCst) { break; }
-
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let state = state.clone();
-        let files_downloaded = files_downloaded.clone();
-        let bytes_downloaded = bytes_downloaded.clone();
-        let bytes_since_last = bytes_since_last.clone();
-        let error_occurred = error_occurred.clone();
-
-        handles.push(tokio::spawn(async move {
-            let mut current_job_error: Option<LauncherError> = None;
-            const MAX_JOB_RETRIES: usize = 3;
-
-            // Skip download if file exists and size matches
-            if job.path.exists() {
-                if let Ok(metadata) = fs::metadata(&job.path) {
-                    if metadata.len() == job.size {
-                        println!("DEBUG: 文件已存在且大小匹配，跳过下载: {}", job.path.display());
-                        files_downloaded.fetch_add(1, Ordering::SeqCst);
-                        bytes_downloaded.fetch_add(job.size, Ordering::SeqCst);
-                        drop(permit);
-                        return Ok(());
-                    }
-                }
-            }
-
-            for retry in 0..MAX_JOB_RETRIES {
-                if !state.load(Ordering::SeqCst) { break; }
-                println!("DEBUG: 尝试下载文件: {} (重试 {}/{})", job.url, retry + 1, MAX_JOB_RETRIES);
-                match download_file(&job, &state, &bytes_downloaded, &bytes_since_last).await {
-                    Ok(_) => {
-                        files_downloaded.fetch_add(1, Ordering::SeqCst);
-                        current_job_error = None;
-                        break; // Success, no more retries needed
-                    }
-                    Err(e) => {
-                        println!("ERROR: 文件下载失败: {} (重试 {}/{}) - {}", job.url, retry + 1, MAX_JOB_RETRIES, e);
-                        current_job_error = Some(e);
-                        tokio::time::sleep(Duration::from_secs(1 << retry)).await; // Exponential backoff
-                    }
-                }
-            }
-
-            if let Some(e) = current_job_error {
-                state.store(false, Ordering::SeqCst); // Cancel all other downloads
-                let mut error_guard = error_occurred.lock().await;
-                if error_guard.is_none() {
-                    *error_guard = Some(e.to_string());
-                }
-            }
-            drop(permit);
-            Ok::<(), LauncherError>(())
-        }));
-    }
-
-    // --- Wait for all downloads to complete ---
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    // --- Finalize and Report Status ---
-    state.store(false, Ordering::SeqCst);
-    reporter_handle.await?;
-
-    if was_cancelled.load(Ordering::SeqCst) {
-        let _ = window.emit("download-progress", &DownloadProgress {
-            progress: files_downloaded.load(Ordering::SeqCst),
-            total: total_files,
-            speed: 0.0,
-            status: DownloadStatus::Cancelled,
-        });
-        return Err(LauncherError::Custom("下载已取消".to_string()));
-    }
-
-    if let Some(err_msg) = error_occurred.lock().await.take() {
-        let _ = window.emit("download-progress", &DownloadProgress {
-            progress: files_downloaded.load(Ordering::SeqCst),
-            total: total_files,
-            speed: 0.0,
-            status: DownloadStatus::Error(err_msg.clone()),
-        });
-        return Err(LauncherError::Custom(err_msg));
-    }
-    
-    // Final success event
-    let _ = window.emit("download-progress", &DownloadProgress {
-        progress: total_files,
-        total: total_files,
-        speed: 0.0,
-        status: DownloadStatus::Completed,
-    });
-
-    Ok(())
-}
-
-
-async fn download_file(
-    job: &DownloadJob,
-    state: &Arc<AtomicBool>,
-    bytes_downloaded: &Arc<AtomicU64>,
-    bytes_since_last: &Arc<AtomicU64>,
-) -> Result<(), LauncherError> {
-    let client = reqwest::Client::new();
-
-    // Try primary URL first
-    match download_chunk(&client, &job.url, job, state, bytes_downloaded, bytes_since_last).await {
-        Ok(_) => return Ok(()), // Success with primary URL
-        Err(e) => {
-            // If primary failed with 404 and fallback exists, try fallback
-            if let Some(fallback_url) = &job.fallback_url {
-                if let LauncherError::Http(err) = &e {
-                    if err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-                        println!("DEBUG: Primary URL {} 404, trying fallback: {}", job.url, fallback_url);
-                        match download_chunk(&client, fallback_url, job, state, bytes_downloaded, bytes_since_last).await {
-                            Ok(_) => {
-                                println!("DEBUG: Fallback download succeeded for {}", fallback_url);
-                                return Ok(());
-                            },
-                            Err(fallback_e) => {
-                                println!("ERROR: Fallback download failed for {}: {}", fallback_url, fallback_e);
-                                return Err(fallback_e);
-                            }
-                        }
-                    }
-                }
-            }
-            // If primary failed for other reasons, or fallback not applicable/failed, return primary error
-            return Err(e);
-        }
-    }
-}
-
-async fn download_chunk(
-    client: &reqwest::Client,
-    url: &str, // The actual URL to download from
-    job: &DownloadJob,
-    state: &Arc<AtomicBool>,
-    bytes_downloaded: &Arc<AtomicU64>,
-    bytes_since_last: &Arc<AtomicU64>,
-) -> Result<(), LauncherError> {
-    // Create parent directory
-    if let Some(parent) = job.path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let response = client.get(url).send().await;
-    let mut response = match response {
-        Ok(res) => res,
-        Err(e) => {
-            println!("ERROR: HTTP请求失败 for {}: {}", url, e);
-            return Err(LauncherError::Http(e));
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        println!("ERROR: HTTP状态码非成功 for {}: {}", url, status);
-        return Err(LauncherError::Http(response.error_for_status().unwrap_err()));
-    }
-
-    let mut file = tokio::fs::File::create(&job.path).await?;
-
-    while let Some(chunk) = response.chunk().await? {
-        if !state.load(Ordering::SeqCst) {
-            return Err(LauncherError::Custom("Download cancelled".to_string()));
-        }
-
-        file.write_all(&chunk).await?;
-        let len = chunk.len() as u64;
-        bytes_downloaded.fetch_add(len, Ordering::Relaxed);
-        bytes_since_last.fetch_add(len, Ordering::Relaxed);
-    }
-
-    // Verify file size after download
-    let actual_size = file.metadata().await?.len();
-    if actual_size != job.size {
-        return Err(LauncherError::Custom(format!(
-            "File size mismatch for {}: expected {}, got {}",
-            job.path.display(), job.size, actual_size
-        )));
-    }
-
-    Ok(())
-}
-
-
-// 启动 Minecraft
-#[tauri::command]
-async fn launch_minecraft(options: LaunchOptions, window: tauri::Window) -> Result<(), LauncherError> {
-    // 保存用户名和UUID到配置文件
-    let uuid = generate_offline_uuid(&options.username);
-    let mut config = load_config()?;
-    config.username = Some(options.username.clone());
-    config.uuid = Some(uuid.clone());
-    save_config(&config)?;
-    
-    // 继续使用更新后的配置
-    let game_dir = PathBuf::from(&config.game_dir);
-    let version_dir = game_dir.join("versions").join(&options.version);
-    let version_json_path = version_dir.join(format!("{}.json", &options.version));
-
-    println!("DEBUG: 尝试启动版本: {}", options.version);
-    println!("DEBUG: 游戏目录: {}", game_dir.display());
-    println!("DEBUG: 版本目录: {}", version_dir.display());
-    println!("DEBUG: 版本JSON路径: {}", version_json_path.display());
-
-    if !version_json_path.exists() {
-        println!("ERROR: 版本JSON文件不存在: {}", version_json_path.display());
-        return Err(LauncherError::Custom(format!("版本 {} 的json文件不存在!", options.version)));
-    }
-
-    let version_json_str = fs::read_to_string(&version_json_path)?;
-    let version_json: serde_json::Value = serde_json::from_str(&version_json_str)?;
-
-    let (libraries_base_dir, assets_base_dir) = (
-        game_dir.join("libraries"), 
-        game_dir.join("assets")
-    );
-    println!("DEBUG: 库文件目录: {}", libraries_base_dir.display());
-    println!("DEBUG: 资源文件目录: {}", assets_base_dir.display());
-
-    // --- 1. 准备隔离目录 ---
-    let natives_dir = version_dir.join("natives");
-    
-    // 创建隔离目录
-    if config.version_isolation {
-        let isolate_dirs = vec![
-            ("saves", config.isolate_saves),
-            ("resourcepacks", config.isolate_resourcepacks),
-            ("logs", config.isolate_logs),
-        ];
-        
-        for (dir_name, should_isolate) in isolate_dirs {
-            let dir_path = version_dir.join(dir_name);
-            if should_isolate && !dir_path.exists() {
-                fs::create_dir_all(&dir_path)?;
-            }
-        }
-        
-        // 复制options.txt
-        let options_src = game_dir.join("options.txt");
-        let options_dst = version_dir.join("options.txt");
-        if options_src.exists() && !options_dst.exists() {
-            fs::copy(&options_src, &options_dst)?;
-        }
-    }
-    println!("DEBUG: Natives目录: {}", natives_dir.display());
-    if natives_dir.exists() {
-        println!("DEBUG: 清理旧的Natives目录: {}", natives_dir.display());
-        fs::remove_dir_all(&natives_dir)?;
-    }
-    fs::create_dir_all(&natives_dir)?;
-
-    if let Some(libraries) = version_json["libraries"].as_array() {
-        for lib in libraries {
-            if let Some(natives) = lib.get("natives") {
-                println!("DEBUG: 发现Natives库: {:?}", lib);
-                if let Some(os_classifier) = natives.get(std::env::consts::OS) {
-                    println!("DEBUG: 正在查找的OS分类器: {}", os_classifier.as_str().unwrap_or("N/A"));
-                    if let Some(artifact) = lib.get("downloads").and_then(|d| d.get("classifiers")).and_then(|c| c.get(os_classifier.as_str().unwrap())) {
-                        println!("DEBUG: Natives Artifact: {:?}", artifact);
-                        let lib_path = libraries_base_dir.join(artifact["path"].as_str().unwrap());
-                        println!("DEBUG: 尝试解压Natives库: {}", lib_path.display());
-                        if !lib_path.exists() {
-                            println!("ERROR: Natives库文件不存在: {}", lib_path.display());
-                            return Err(LauncherError::Custom(format!("Natives库文件不存在: {}", lib_path.display())));
-                        }
-                        let file = fs::File::open(&lib_path)?;
-                        let mut archive = zip::ZipArchive::new(file)?;
-
-                        for i in 0..archive.len() {
-                            let mut file = archive.by_index(i)?;
-                            let outpath = natives_dir.join(file.name());
-
-                            // 检查是否需要排除
-                            if let Some(extract_rules) = lib.get("extract") {
-                                if let Some(exclude) = extract_rules.get("exclude").and_then(|e| e.as_array()) {
-                                    if exclude.iter().any(|v| file.name().starts_with(v.as_str().unwrap())) {
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if (*file.name()).ends_with('/') {
-                                fs::create_dir_all(&outpath)?;
-                            } else {
-                                if let Some(p) = outpath.parent() {
-                                    if !p.exists() {
-                                        fs::create_dir_all(&p)?;
-                                    }
-                                }
-                                let mut outfile = fs::File::create(&outpath)?;
-                                io::copy(&mut file, &mut outfile)?;
-                                println!("DEBUG: 解压Natives文件: {}", outpath.display());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // --- 2. 构建 Classpath ---
-    let mut classpath = vec![];
-    if let Some(libraries) = version_json["libraries"].as_array() {
-        for lib in libraries {
-            if lib.get("natives").is_some() { continue; } // 跳过Natives库
-
-            if let Some(rules) = lib.get("rules").and_then(|r| r.as_array()) {
-                let mut allowed = true;
-                for rule in rules {
-                    if let Some(os) = rule.get("os") {
-                        if let Some(name) = os["name"].as_str() {
-                            if name == std::env::consts::OS {
-                                allowed = rule["action"].as_str() == Some("allow");
-                            } else {
-                                allowed = rule["action"].as_str() != Some("allow");
-                            }
-                        }
-                    }
-                }
-                if !allowed { continue; }
-            }
-
-            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
-                let lib_path = libraries_base_dir.join(path);
-                println!("DEBUG: 添加到Classpath的库: {}", lib_path.display());
-                if !lib_path.exists() {
-                    println!("ERROR: Classpath中的库文件不存在: {}", lib_path.display());
-                    return Err(LauncherError::Custom(format!("Classpath中的库文件不存在: {}", lib_path.display())));
-                }
-                classpath.push(lib_path);
-            }
-        }
-    }
-    let main_game_jar_path = version_dir.join(format!("{}.jar", &options.version));
-    println!("DEBUG: 主游戏JAR路径: {}", main_game_jar_path.display());
-    if !main_game_jar_path.exists() {
-        println!("ERROR: 主游戏JAR文件不存在: {}", main_game_jar_path.display());
-        return Err(LauncherError::Custom(format!("主游戏JAR文件不存在: {}", main_game_jar_path.display())));
-    }
-    classpath.push(main_game_jar_path);
-    let classpath_str = classpath.iter()
-        .map(|p| p.to_string_lossy())
-        .collect::<Vec<_>>().join(if cfg!(windows) { ";" } else { ":" });
-    println!("DEBUG: 最终Classpath: {}", classpath_str);
-
-    // --- 3. 获取主类和参数 ---
-    let main_class = version_json["mainClass"].as_str().ok_or_else(|| LauncherError::Custom("无法在json中找到mainClass".to_string()))?;
-    let assets_index = version_json["assetIndex"]["id"].as_str().unwrap_or(&options.version);
-    let assets_dir = assets_base_dir;
-
-    // 替换通用占位符的辅助函数
-    let replace_placeholders = |arg: &str| -> String {
-        let actual_game_dir = if config.version_isolation {
-            version_dir.to_string_lossy().to_string()
-        } else {
-            game_dir.to_string_lossy().to_string()
-        };
-
-        arg.replace("${auth_player_name}", &options.username)
-           .replace("${version_name}", &options.version)
-           .replace("${game_directory}", &actual_game_dir)
-           .replace("${assets_root}", &assets_dir.to_string_lossy().to_string())
-           .replace("${assets_index_name}", assets_index)
-           .replace("${auth_uuid}", &generate_offline_uuid(&options.username))
-           .replace("${auth_access_token}", "0")
-           .replace("${user_type}", "legacy")
-           .replace("${version_type}", version_json["type"].as_str().unwrap_or("release"))
-           .replace("${user_properties}", "{}")
-    };
-
-    let mut jvm_args = vec![];
-    let mut game_args_vec = vec![];
-
-    // 处理新版 (1.13+) `arguments` 格式
-    if let Some(arguments) = version_json.get("arguments") {
-        if let Some(jvm) = arguments["jvm"].as_array() {
-            for arg in jvm {
-                if let Some(s) = arg.as_str() {
-                    jvm_args.push(replace_placeholders(s));
-                } else if let Some(obj) = arg.as_object() {
-                    // 处理带规则的JVM参数
-                    let mut allowed = true;
-                    if let Some(rules) = obj.get("rules").and_then(|r| r.as_array()) {
-                         for rule in rules {
-                            if let Some(os) = rule.get("os") {
-                                if let Some(name) = os["name"].as_str() {
-                                    if name == std::env::consts::OS {
-                                        allowed = rule["action"].as_str() == Some("allow");
-                                    } else {
-                                        allowed = rule["action"].as_str() != Some("allow");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if allowed {
-                        if let Some(value) = obj.get("value") {
-                            if let Some(s) = value.as_str() {
-                                jvm_args.push(replace_placeholders(s));
-                            } else if let Some(arr) = value.as_array() {
-                                for item in arr {
-                                    jvm_args.push(replace_placeholders(item.as_str().unwrap()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(game) = arguments["game"].as_array() {
-            for arg in game {
-                if let Some(s) = arg.as_str() {
-                    game_args_vec.push(replace_placeholders(s));
-                }
-            }
-        }
-    } 
-    // 处理旧版 `minecraftArguments` 格式
-    else if let Some(mc_args) = version_json["minecraftArguments"].as_str() {
-        game_args_vec = mc_args.split(' ').map(replace_placeholders).collect();
-    }
-
-    // --- 4. 组装Java启动参数 ---
-    let java_path = {
-        // 1. 首先尝试使用配置中的Java路径
-        if let Some(config_path) = load_config()?.java_path {
-            if PathBuf::from(&config_path).exists() {
-                config_path
-            } else {
-                // 2. 如果配置路径不存在，尝试在PATH中查找
-                if Command::new("java").arg("-version").output().is_ok() {
-                    "java".to_string()
-                } else {
-                    return Err(LauncherError::Custom(format!(
-                        "配置的Java路径不存在且系统PATH中未找到Java: {}",
-                        config_path
-                    )));
-                }
-            }
-        } else {
-            // 3. 如果未配置路径，尝试在PATH中查找
-            if Command::new("java").arg("-version").output().is_ok() {
-                "java".to_string()
-            } else {
-                return Err(LauncherError::Custom(
-                    "未配置Java路径且系统PATH中未找到Java".to_string(),
-                ));
-            }
-        }
-    };
-    println!("DEBUG: 使用的Java路径: {}", java_path);
-
-    let mut final_args = vec![
-        format!("-Xmx{}M", options.memory.unwrap_or(2048)),
-        format!("-Djava.library.path={}", natives_dir.to_string_lossy()),
-    ];
-    final_args.extend(jvm_args);
-    final_args.push("-cp".to_string());
-    final_args.push(classpath_str);
-    final_args.push(main_class.to_string());
-    final_args.extend(game_args_vec);
-
-    // --- 5. 启动游戏 ---
-    let mut command = Command::new(&java_path);
-    command.args(&final_args);
-    command.current_dir(&game_dir);
-    
-    // 在Windows上隐藏命令行窗口
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW = 0x08000000
-        // 使用这个标志可以隐藏命令行窗口
-        command.creation_flags(0x08000000);
-    }
-
-    println!("DEBUG: 最终启动命令: {:?}", command);
-    window.emit("launch-command", format!("{:?}", command))?;
-
-    // 启动游戏进程但不等待它结束
-    let child = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    
-    println!("DEBUG: 游戏已启动，PID: {:?}", child.id());
-    
-    // 发送游戏启动成功的事件到前端
-    window.emit("minecraft-launched", format!("游戏已启动，PID: {}", child.id()))?;
-    
-    // 在后台线程中监控游戏进程，不阻塞主线程
-    let window_clone = window.clone();
-    std::thread::spawn(move || {
-        match child.wait_with_output() {
-            Ok(output) => {
-                let status = output.status;
-                println!("DEBUG: 游戏进程退出，状态码: {:?}", status.code());
-                // 发送游戏退出事件到前端
-                let _ = window_clone.emit("minecraft-exited", format!("游戏已退出，状态码: {:?}", status.code()));
-            }
-            Err(e) => {
-                println!("DEBUG: 等待游戏进程时出错: {:?}", e);
-                // 发送错误事件到前端
-                let _ = window_clone.emit("minecraft-error", format!("监控游戏进程时出错: {}", e));
-            }
-        }
-    });
-
-    println!("DEBUG: 游戏成功启动");
-    Ok(())
+    download_all_files_impl(jobs, window, total_files, mirror).await
 }
 
 // 获取游戏目录
@@ -1184,78 +571,8 @@ async fn set_version_isolation(enabled: bool) -> Result<(), LauncherError> {
     Ok(())
 }
 
-// 查找Java安装路径
-#[tauri::command]
-async fn find_java_installations_command() -> Result<Vec<String>, LauncherError> {
-    let mut paths = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        let program_files =
-            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
-        let program_files_x86 =
-            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
-
-        // 检查常见Java安装路径
-        let java_dirs = vec![
-            format!("{}\\Java", program_files),
-            format!("{}\\Java", program_files_x86),
-            r"C:\Program Files\Java".to_string(),
-            r"C:\Program Files (x86)\Java".to_string(),
-        ];
-
-        for dir in java_dirs {
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let dir_name = entry.file_name().to_string_lossy().to_lowercase();
-                        if dir_name.contains("jdk") || dir_name.contains("jre") {
-                            let java_exe = entry.path().join("bin").join("java.exe");
-                            if java_exe.exists() {
-                                paths.push(java_exe.to_string_lossy().into_owned());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 检查PATH中的java
-    if Command::new("java").arg("-version").output().is_ok() {
-        paths.push("java".to_string());
-    }
-
-    // 去重并排序
-    paths.sort();
-    paths.dedup();
-
-    Ok(paths)
-}
-
-// 设置Java路径
-#[tauri::command]
-async fn set_java_path_command(path: String) -> Result<(), LauncherError> {
-    // 标准化路径格式
-    let normalized_path = if cfg!(windows) {
-        path.replace("/", "\\") // 统一为Windows路径分隔符
-    } else {
-        path.replace("\\", "/") // 统一为Unix路径分隔符
-    };
-
-    // 验证路径是否有效
-    if !PathBuf::from(&normalized_path).exists() {
-        return Err(LauncherError::Custom(format!("Java路径不存在: {}", normalized_path)));
-    }
-
-    let mut config = load_config()?;
-    config.java_path = Some(normalized_path);
-    save_config(&config)?;
-    Ok(())
-}
-
 // 辅助函数
-fn load_config() -> Result<GameConfig, LauncherError> {
+pub fn load_config() -> Result<GameConfig, LauncherError> {
     let config_path = get_config_path()?;
     
     if config_path.exists() {
@@ -1303,36 +620,10 @@ fn load_config() -> Result<GameConfig, LauncherError> {
     }
 }
 
-fn save_config(config: &GameConfig) -> Result<(), LauncherError> {
+pub fn save_config(config: &GameConfig) -> Result<(), LauncherError> {
     let config_path = get_config_path()?;
     fs::write(config_path, serde_json::to_string_pretty(config)?)?;
     Ok(())
-}
-
-// 生成Minecraft离线模式UUID
-fn generate_offline_uuid(username: &str) -> String {
-    // 首先检查配置中是否已有保存的UUID
-    if let Ok(config) = load_config() {
-        // 如果用户名匹配且已有UUID，则直接返回保存的UUID
-        if let (Some(saved_username), Some(saved_uuid)) = (&config.username, &config.uuid) {
-            if saved_username == username {
-                return saved_uuid.clone();
-            }
-        }
-    }
-    
-    // 如果没有保存的UUID或用户名不匹配，则生成新的UUID
-    // Minecraft官方算法: MD5("OfflinePlayer:" + username)
-    let mut hasher = Md5::new();
-    hasher.update(b"OfflinePlayer:");
-    hasher.update(username.as_bytes());
-    let result = hasher.finalize();
-    
-    // 将MD5哈希转换为UUID格式
-    let bytes: [u8; 16] = result.into();
-    let uuid = Uuid::new_v5(&Uuid::NAMESPACE_DNS, &bytes);
-    
-    uuid.to_string()
 }
 
 fn get_config_path() -> Result<PathBuf, LauncherError> {
@@ -1342,7 +633,6 @@ fn get_config_path() -> Result<PathBuf, LauncherError> {
     
     Ok(exe_dir.join("ar1s.json"))
 }
-
 
 #[tauri::command]
 fn get_download_threads() -> Result<u8, LauncherError> {
@@ -1356,41 +646,6 @@ async fn set_download_threads(threads: u8) -> Result<(), LauncherError> {
     config.download_threads = threads;
     save_config(&config)?;
     Ok(())
-}
-
-#[tauri::command]
-async fn validate_java_path(path: String) -> Result<bool, LauncherError> {
-    let java_exe = PathBuf::from(&path);
-    if java_exe.is_file() {
-        // 检查java.exe是否存在
-        let output = Command::new(&java_exe)
-            .arg("-version")
-            .output();
-
-        match output {
-            Ok(out) => {
-                // 检查stderr中是否包含"java version"或"openjdk version"字符串
-                let stderr_str = String::from_utf8_lossy(&out.stderr);
-                Ok(out.status.success() && (stderr_str.contains("java version") || stderr_str.contains("openjdk version")))
-            },
-            Err(_) => Ok(false),
-        }
-    } else if path.to_lowercase() == "java" {
-        // 检查Java路径
-        let output = Command::new("java")
-            .arg("-version")
-            .output();
-        match output {
-            Ok(out) => {
-                let stderr_str = String::from_utf8_lossy(&out.stderr);
-                Ok(out.status.success() && (stderr_str.contains("java version") || stderr_str.contains("openjdk version")))
-            },
-            Err(_) => Ok(false),
-        }
-    }
-    else {
-        Ok(false)
-    }
 }
 
 // 验证版本文件完整性
@@ -1471,49 +726,22 @@ async fn validate_version_files(version_id: String) -> Result<Vec<String>, Launc
     Ok(missing_files)
 }
 
-// 获取保存的用户名
-#[allow(dead_code)]
-#[tauri::command]
-async fn get_saved_username() -> Result<Option<String>, LauncherError> {
-    let config = load_config()?;
-    Ok(config.username)
-}
 
-// 设置保存的用户名
-#[allow(dead_code)]
-#[tauri::command]
-async fn set_saved_username(username: String) -> Result<(), LauncherError> {
-    let mut config = load_config()?;
-    config.username = Some(username);
-    save_config(&config)?;
-    Ok(())
-}
-
-// 获取保存的UUID
-#[allow(dead_code)]
-#[tauri::command]
-async fn get_saved_uuid() -> Result<Option<String>, LauncherError> {
-    let config = load_config()?;
-    Ok(config.uuid)
-}
-
-// 设置保存的UUID
-#[allow(dead_code)]
-#[tauri::command]
-async fn set_saved_uuid(uuid: String) -> Result<(), LauncherError> {
-    let mut config = load_config()?;
-    config.uuid = Some(uuid);
-    save_config(&config)?;
-    Ok(())
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    println!("[DEBUG] 程序启动");
+    
+    // 程序启动时初始化日志
+    match init_logging() {
+        Ok(path) => println!("[DEBUG] 日志系统初始化完成，路径: {}", path.display()),
+        Err(e) => eprintln!("[ERROR] 初始化日志失败: {}", e),
+    }
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
-        // 对话框功能已内置
         .plugin(tauri_plugin_http::init())
         .invoke_handler(tauri::generate_handler![
             get_versions,
@@ -1525,19 +753,23 @@ pub fn run() {
             set_game_dir,
             select_game_dir,
             set_version_isolation,
-            find_java_installations_command,
-            set_java_path_command,
+            java::find_java_installations_command,
+            java::set_java_path_command,
             load_config_key,
             save_config_key,
-            validate_java_path,
+            java::validate_java_path,
             get_download_threads,
             set_download_threads,
             validate_version_files,
-            get_saved_username,
-            set_saved_username,
-            get_saved_uuid,
-            set_saved_uuid
+            auth::get_saved_username,
+            auth::set_saved_username,
+            auth::get_saved_uuid,
+            auth::set_saved_uuid
         ])
+        .setup(|_| {
+            println!("[DEBUG] Tauri应用初始化完成");
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

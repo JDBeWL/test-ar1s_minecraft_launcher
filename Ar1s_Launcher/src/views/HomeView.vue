@@ -6,11 +6,32 @@ import { listen } from '@tauri-apps/api/event';
 const installedVersions = ref<string[]>([])
 const selectedVersion = ref('')
 const memory = ref(2048)
-const username = ref('Player')
+const username = ref('') // Don't default to 'Player'
 const offlineMode = ref(true)
 const loading = ref(false)
 const gameDir = ref('') // 游戏目录变量
 const missingFiles = ref<string[]>([]); // 新增：缺失文件列表
+
+// Load saved username from backend
+async function loadUsername() {
+  try {
+    const savedUsername = await invoke('get_saved_username');
+    if (savedUsername) {
+      username.value = savedUsername as string;
+    }
+  } catch (err) {
+    console.error("Failed to load username:", err);
+  }
+}
+
+// Save username to backend
+async function saveUsername(newName: string) {
+  try {
+    await invoke('set_saved_username', { username: newName });
+  } catch (err) {
+    console.error("Failed to save username:", err);
+  }
+}
 
 // 加载已保存的游戏目录
 async function loadGameDir() {
@@ -96,6 +117,7 @@ async function launchGame() {
 // 在组件挂载时加载游戏目录和监听事件
 onMounted(async () => {
   await loadGameDir();
+  await loadUsername();
   await validateFiles(); // 初始验证
   
   // 监听游戏目录变更事件
@@ -113,6 +135,13 @@ watch(selectedVersion, (newVal) => {
     validateFiles();
   } else {
     missingFiles.value = [];
+  }
+});
+
+// Watch for username changes and save them
+watch(username, (newName) => {
+  if (newName !== null && newName !== undefined) {
+    saveUsername(newName);
   }
 });
 </script>
