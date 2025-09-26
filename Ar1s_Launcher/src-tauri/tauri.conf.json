@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ar1s_launcher",
+  "productName": "Ar1s Launcher",
   "version": "0.1.0",
   "identifier": "com.jdbewl.ar1s-launcher",
   "build": {
@@ -12,14 +12,19 @@
   "app": {
     "windows": [
       {
-        "title": "ar1s_launcher",
+        "title": "Ar1s Launcher",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "userAgent": "Ar1s Launcher",
+        "label": "main",
+        "center": true,
+        "decorations": true
       }
     ],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,
