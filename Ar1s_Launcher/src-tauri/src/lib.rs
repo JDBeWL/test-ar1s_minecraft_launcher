@@ -221,7 +221,7 @@ async fn fetch_versions(client: &reqwest::Client, url: &str) -> Result<VersionMa
     Ok(manifest)
 }
 
-// A struct to hold file download information
+// 下载任务
 #[derive(Clone)]
 struct DownloadJob {
     url: String,
@@ -1154,7 +1154,7 @@ async fn get_game_dir_info() -> Result<GameDirInfo, LauncherError> {
         }
     }
 
-    // total_size is not used in the frontend, so we can just return 0
+    // 计算游戏目录大小
     Ok(GameDirInfo {
         path: game_dir_str,
         versions,
@@ -1362,21 +1362,21 @@ async fn set_download_threads(threads: u8) -> Result<(), LauncherError> {
 async fn validate_java_path(path: String) -> Result<bool, LauncherError> {
     let java_exe = PathBuf::from(&path);
     if java_exe.is_file() {
-        // Try to run "java -version" to confirm it's a valid Java executable
+        // 检查java.exe是否存在
         let output = Command::new(&java_exe)
             .arg("-version")
             .output();
 
         match output {
             Ok(out) => {
-                // Check if stderr contains "java version" or "openjdk version"
+                // 检查stderr中是否包含"java version"或"openjdk version"字符串
                 let stderr_str = String::from_utf8_lossy(&out.stderr);
                 Ok(out.status.success() && (stderr_str.contains("java version") || stderr_str.contains("openjdk version")))
             },
-            Err(_) => Ok(false), // Command failed to execute
+            Err(_) => Ok(false),
         }
     } else if path.to_lowercase() == "java" {
-        // If path is just "java", check if it's in PATH
+        // 检查Java路径
         let output = Command::new("java")
             .arg("-version")
             .output();
@@ -1507,25 +1507,6 @@ async fn set_saved_uuid(uuid: String) -> Result<(), LauncherError> {
     Ok(())
 }
 
-// 尝试修改WebView2进程名称的函数
-#[cfg(target_os = "windows")]
-fn try_rename_webview_process() {
-    use std::thread;
-    use std::time::Duration;
-    
-    // 在后台线程中执行，以便不阻塞主线程
-    thread::spawn(|| {
-        // 等待一段时间，确保WebView2进程已经启动
-        thread::sleep(Duration::from_secs(2));
-        
-        println!("尝试修改WebView2进程名称");
-        
-        // 注意：这里只是记录日志，实际上我们无法直接修改WebView2进程的名称
-        // 因为WebView2进程是由Microsoft Edge WebView2运行时控制的
-        println!("WebView2进程名称由Microsoft Edge WebView2运行时控制，无法直接修改");
-    });
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1534,21 +1515,6 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         // 对话框功能已内置
         .plugin(tauri_plugin_http::init())
-        .setup(|app| {
-            // 设置WebView进程名称
-            #[cfg(target_os = "windows")]
-            {
-                // 尝试修改WebView2进程名称
-                try_rename_webview_process();
-                
-                // 在setup中注册一个事件处理器，当窗口创建后执行
-                app.listen("tauri://window-created", move |_| {
-                    // 这里无法直接访问窗口，但我们可以在前端代码中设置用户代理
-                    println!("窗口已创建，尝试设置WebView用户代理");
-                });
-            }
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             get_versions,
             download_version,
