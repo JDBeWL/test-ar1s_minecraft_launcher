@@ -6,6 +6,11 @@ pub fn default_download_threads() -> u8 {
     8
 }
 
+// 默认最大内存 (MB)
+pub fn default_max_memory() -> u32 {
+    4096
+}
+
 // 默认为true的辅助函数
 pub fn default_true() -> bool {
     true
@@ -29,6 +34,8 @@ pub struct GameConfig {
     pub isolate_logs: bool,
     pub username: Option<String>,
     pub uuid: Option<String>,
+    #[serde(default = "default_max_memory")]
+    pub max_memory: u32,
 }
 
 // 游戏目录信息

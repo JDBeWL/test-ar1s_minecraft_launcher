@@ -25,14 +25,21 @@ pub async fn find_java_installations_command() -> Result<Vec<String>, LauncherEr
         ];
 
         for dir in java_dirs {
-            if let Ok(entries) = fs::read_dir(&dir) {
+            // Normalize the directory path before reading it
+            let normalized_dir = dir.replace("\\", "/");
+            if let Ok(entries) = fs::read_dir(&normalized_dir) {
                 for entry in entries.flatten() {
                     if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let dir_name = entry.file_name().to_string_lossy().to_lowercase();
                         if dir_name.contains("jdk") || dir_name.contains("jre") {
                             let java_exe = entry.path().join("bin").join("java.exe");
                             if java_exe.exists() {
-                                paths.push(java_exe.to_string_lossy().into_owned());
+                                let mut final_path = java_exe.to_string_lossy().replace("\\", "/");
+                                // Collapse multiple forward slashes into single ones
+                                while final_path.contains("//") {
+                                    final_path = final_path.replace("//", "/");
+                                }
+                                paths.push(final_path.to_owned());
                             }
                         }
                     }

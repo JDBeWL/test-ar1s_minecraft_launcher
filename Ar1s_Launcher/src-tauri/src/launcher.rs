@@ -402,6 +402,7 @@ fn load_config() -> Result<GameConfig, LauncherError> {
             isolate_logs: true,
             username: None,
             uuid: None,
+            max_memory: 4096, // 默认最大内存为4GB
         };
 
         // 保存配置

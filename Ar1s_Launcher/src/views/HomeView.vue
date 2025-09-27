@@ -2,10 +2,11 @@
 import { ref, onMounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from '@tauri-apps/api/event';
+import { useSettingsStore } from '../stores/settings';
 
+const settingsStore = useSettingsStore()
 const installedVersions = ref<string[]>([])
 const selectedVersion = ref('')
-const memory = ref(2048)
 const username = ref('') // Don't default to 'Player'
 const offlineMode = ref(true)
 const loading = ref(false)
@@ -100,7 +101,7 @@ async function launchGame() {
     await invoke('launch_minecraft', {
       options: {
         version: selectedVersion.value,
-        memory: memory.value,
+        memory: settingsStore.maxMemory,
         username: username.value,
         offline: offlineMode.value,
         game_dir: gameDir.value
@@ -203,25 +204,12 @@ watch(username, (newName) => {
         <v-card class="mt-4">
           <v-card-title>游戏设置</v-card-title>
           <v-card-text>
-            <v-text-field
-              v-model="gameDir"
-              label="游戏目录"
-              readonly
-            ></v-text-field>
             
             <v-text-field
               v-model="username"
               label="用户名"
             ></v-text-field>
 
-            <v-slider
-              v-model="memory"
-              label="内存 (MB)"
-              min="1024"
-              max="8192"
-              step="512"
-              thumb-label
-            ></v-slider>
 
             <v-switch
               v-model="offlineMode"

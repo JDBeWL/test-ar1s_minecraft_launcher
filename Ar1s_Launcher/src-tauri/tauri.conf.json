@@ -13,12 +13,14 @@
     "windows": [
       {
         "title": "Ar1s Launcher",
-        "width": 800,
-        "height": 600,
+        "width":900,
+        "height": 650,
+        "minWidth": 600,
+        "minHeight": 400,
         "userAgent": "Ar1s Launcher",
         "label": "main",
         "center": true,
-        "decorations": true
+        "decorations": false
       }
     ],
     "security": {

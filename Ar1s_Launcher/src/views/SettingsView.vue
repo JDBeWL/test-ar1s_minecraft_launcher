@@ -1,9 +1,17 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, computed } from "vue";
+
+function formatJavaPath(rawPath: string) {
+  if (!rawPath) return '';
+  // 统一转换为正斜杠显示
+  return rawPath.replace(/\\/g, '/');
+}
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from '@tauri-apps/api/event';
+import { useSettingsStore } from '../stores/settings';
 
+const settingsStore = useSettingsStore()
 const gameDir = ref('')
 const versionIsolation = ref(true)
 const javaPath = ref('')
@@ -11,6 +19,10 @@ const isJavaPathValid = ref(false)
 const javaInstallations = ref<string[]>([])
 const loadingJava = ref(false)
 const downloadThreads = ref(8);
+
+const totalMemoryGB = computed(() => (settingsStore.totalMemoryMB / 1024).toFixed(1));
+
+// 内存相关函数已迁移到Pinia store
 
 // 加载已保存的游戏目录
 async function loadGameDir() {
@@ -97,6 +109,8 @@ async function saveDownloadThreads() {
 
 // 在组件挂载时加载所有设置
 onMounted(async () => {
+  await settingsStore.loadSystemMemory();
+  await settingsStore.loadMaxMemory();
   await loadGameDir();
   await loadJavaPath();
   await findJavaInstallations();
@@ -127,6 +141,40 @@ onMounted(async () => {
           label="版本隔离"
         ></v-switch>
 
+        <v-row align="center" class="mt-4">
+          <v-col cols="8">
+            <v-slider
+              v-model="settingsStore.maxMemory"
+              label="最大内存 (MB)"
+              :min="512"
+              :max="Math.floor(settingsStore.totalMemoryMB * 0.8)"
+              :step="128"
+              thumb-label
+              :hint="`可用范围: 512MB - ${Math.floor(settingsStore.totalMemoryMB * 0.8)}MB (80% of ${settingsStore.totalMemoryMB}MB)`"
+              persistent-hint
+              @end="settingsStore.saveMaxMemory"
+            ></v-slider>
+          </v-col>
+          <v-col cols="4">
+            <v-text-field
+              v-model.number="settingsStore.maxMemory"
+              type="number"
+              label="内存大小"
+              suffix="MB"
+              :rules="[
+                v => !!v || '必须输入内存大小',
+                v => (v >= 512 && v <= Math.floor(settingsStore.totalMemoryMB * 0.8)) || `必须在512-${Math.floor(settingsStore.totalMemoryMB * 0.8)}MB之间`
+              ]"
+              density="compact"
+              @change="settingsStore.saveMaxMemory"
+            ></v-text-field>
+          </v-col>
+        </v-row>
+        <div class="text-caption ml-2 mb-4">
+          系统总内存: {{ settingsStore.totalMemoryMB }} MB (约 {{ totalMemoryGB }} GB)
+        </div>
+
+
         <v-slider
           v-model="downloadThreads"
           label="下载线程数"
@@ -141,14 +189,14 @@ onMounted(async () => {
           @end="saveDownloadThreads"
         ></v-slider>
 
-        <v-select
+        <v-combobox
           v-model="javaPath"
-          :items="javaInstallations"
+          :items="javaInstallations.map(p => formatJavaPath(p))"
           label="Java 路径"
           class="mt-8"
           :loading="loadingJava"
           persistent-hint
-          hint="选择一个Java安装路径"
+          hint="选择或输入一个Java路径"
           @update:model-value="setJavaPath"
         >
           <template v-slot:append>
@@ -162,16 +210,7 @@ onMounted(async () => {
               <v-icon>mdi-refresh</v-icon>
             </v-btn>
           </template>
-        </v-select>
-        
-        <v-text-field
-          v-model="javaPath"
-          label="自定义Java路径"
-          hint="如果下拉菜单中没有您想要的Java路径，可以在这里手动输入"
-          persistent-hint
-          append-inner-icon="mdi-content-save"
-          @click:append-inner="setJavaPath(javaPath)"
-        ></v-text-field>
+        </v-combobox>
       </v-card-text>
     </v-card>
   </v-container>

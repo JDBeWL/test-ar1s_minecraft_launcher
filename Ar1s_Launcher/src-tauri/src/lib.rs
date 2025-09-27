@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use sysinfo::System;
 use std::path::PathBuf;
 use tauri::Emitter;
 
@@ -483,6 +484,7 @@ async fn load_config_key(key: String) -> Result<Option<String>, LauncherError> {
         "isolateLogs" => Ok(Some(config.isolate_logs.to_string())),
         "username" => Ok(config.username),
         "uuid" => Ok(config.uuid),
+        "maxMemory" => Ok(Some(config.max_memory.to_string())),
         _ => Err(LauncherError::Custom(format!("Unknown config key: {}", key))),
     }
 }
@@ -501,6 +503,7 @@ async fn save_config_key(key: String, value: String) -> Result<(), LauncherError
         "isolateLogs" => config.isolate_logs = value.parse().map_err(|_| LauncherError::Custom("Invalid boolean value for isolateLogs".to_string()))?,
         "username" => config.username = Some(value),
         "uuid" => config.uuid = Some(value),
+        "maxMemory" => config.max_memory = value.parse().map_err(|_| LauncherError::Custom("Invalid u32 value for maxMemory".to_string()))?,
         _ => return Err(LauncherError::Custom(format!("Unknown config key: {}", key))),
     }
     save_config(&config)?;
@@ -600,19 +603,19 @@ pub fn load_config() -> Result<GameConfig, LauncherError> {
         }
 
         // 创建并返回配置
-        let config = GameConfig {
-            game_dir: mc_dir_str,
-            version_isolation: true,
-            java_path: None,
-            download_threads: 8,
-            language: Some("zh_cn".to_string()),
-            isolate_saves: true,
-            isolate_resourcepacks: true,
-            isolate_logs: true,
-            username: None,
-            uuid: None,
-        };
-
+                    let config = GameConfig {
+                        game_dir: mc_dir_str,
+                        version_isolation: true,
+                        java_path: None,
+                        download_threads: 8,
+                        language: Some("zh_cn".to_string()),
+                        isolate_saves: true,
+                        isolate_resourcepacks: true,
+                        isolate_logs: true,
+                        username: None,
+                        uuid: None,
+                        max_memory: models::default_max_memory(),
+                    };
         // 保存配置
         save_config(&config)?;
 
@@ -728,6 +731,13 @@ async fn validate_version_files(version_id: String) -> Result<Vec<String>, Launc
 
 
 
+#[tauri::command]
+fn get_total_memory() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[DEBUG] 程序启动");
@@ -764,7 +774,8 @@ pub fn run() {
             auth::get_saved_username,
             auth::set_saved_username,
             auth::get_saved_uuid,
-            auth::set_saved_uuid
+            auth::set_saved_uuid,
+            get_total_memory
         ])
         .setup(|_| {
             println!("[DEBUG] Tauri应用初始化完成");
