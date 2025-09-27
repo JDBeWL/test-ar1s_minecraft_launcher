@@ -105,7 +105,13 @@ async fn get_versions() -> Result<VersionManifest, LauncherError> {
 
 async fn fetch_versions(client: &reqwest::Client, url: &str) -> Result<VersionManifest, LauncherError> {
     // 创建日志文件
-    let log_file = PathBuf::from("logs").join("network_debug.log");
+    // 确保logs目录存在
+    let logs_dir = std::env::current_dir()?.join("logs");
+    if !logs_dir.exists() {
+        fs::create_dir_all(&logs_dir)?;
+    }
+    
+    let log_file = logs_dir.join("network_debug.log");
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)

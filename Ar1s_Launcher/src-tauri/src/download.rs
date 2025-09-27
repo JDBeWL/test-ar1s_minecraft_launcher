@@ -345,6 +345,14 @@ async fn download_chunk(
         fs::create_dir_all(parent)?;
     }
 
+    // 确保.minecraft/logs目录存在
+    if let Some(mc_dir) = job.path.parent().and_then(|p| p.parent()) {
+        let logs_dir = mc_dir.join("logs");
+        if !logs_dir.exists() {
+            fs::create_dir_all(logs_dir)?;
+        }
+    }
+
     let response = client.get(url).send().await;
     let mut response = match response {
         Ok(res) => res,
